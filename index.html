@@ -1,0 +1,740 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<title>Video Segmentation — Corporate Background</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;margin:18px;background:#f6f7fb;color:#111}
+  h1{margin:0 0 12px}
+  #panes{display:flex;gap:20px}
+  #left{width:360px}
+  #video,#canvas,#outPreview{width:320px;height:240px;border:1px solid #ccc;display:block;margin-bottom:10px;background:#000}
+  label{display:block;margin:6px 0;font-size:13px}
+  .row{display:flex;gap:8px;align-items:center}
+  .small{font-size:12px;color:#666}
+  input[type=range]{width:220px}
+  button{padding:8px 14px;border-radius:6px;border:none;background:#0052CC;color:#fff;cursor:pointer}
+  button.secondary{background:#e6eefc;color:#0052CC}
+  select{padding:6px;border-radius:6px}
+  #status{margin-top:8px;font-size:13px}
+  .param-group{margin-bottom:15px;padding:10px;background:#fff;border-radius:8px;border:1px solid #e1e5e9}
+  .param-group h3{margin:0 0 8px 0;font-size:14px;color:#0052CC}
+  #backgroundControls{margin-top:15px;padding:10px;background:#e6f7ff;border-radius:8px;border:1px solid #b3e0ff}
+  textarea{width:100%;height:120px;padding:8px;border:1px solid #ccc;border-radius:6px;font-family:monospace;font-size:11px}
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@1.0.2"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head>
+<body>
+<h1>Video Segmentation — Corporate Background</h1>
+
+<div id="panes">
+  <div id="left">
+    <div id="loading">Loading camera and model...</div>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="row">
+      <button id="startBtn">Start</button>
+      <button id="stopBtn" class="secondary">Stop</button>
+      <button id="outputBtn" class="secondary">Start Output Stream</button>
+    </div>
+
+    <div id="status" class="small">FPS: <span id="fps">0</span> · Latency: <span id="latency">0</span> ms</div>
+    <div style="margin-top:8px">
+      <label>Performance Preset:
+        <select id="preset">
+          <option value="fast">Fast (96px)</option>
+          <option value="balanced">Balanced (160px)</option>
+          <option value="quality">Quality (224px)</option>
+          <option value="ultra" selected>Ultra Quality (320px)</option>
+        </select>
+      </label>
+    </div>
+
+    <div id="backgroundControls">
+      <label>Privacy Level:
+        <select id="privacyLevel">
+          <option value="low">Low</option>
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+        </select>
+      </label>
+
+      <div style="margin-top:10px">
+        <textarea id="jsonInput" placeholder='{
+  "employee": {
+    "full_name": "Иванов Сергей Петрович",
+    "position": "Ведущий инженер",
+    ...
+  }
+}'></textarea>
+      </div>
+      <div style="margin-top:8px">
+        <button id="updateBgBtn" class="secondary">Update Background</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="param-group">
+      <h3>Segmentation Quality</h3>
+      <div>
+        <label>Model Confidence <span id="lab_thresh">235</span></label>
+        <input id="s_thresh" type="range" min="150" max="255" step="1" value="235"/>
+        <div class="small">Higher = stricter detection</div>
+      </div>
+      <div>
+        <label>Edge Smoothing <span id="lab_feather">14</span>px</label>
+        <input id="s_feather" type="range" min="0" max="20" step="1" value="14"/>
+        <div class="small">Blur on final edges</div>
+      </div>
+    </div>
+
+    <div class="param-group">
+      <h3>Advanced Settings</h3>
+      <div>
+        <label>Low-res Blur <span id="lab_blur">1</span></label>
+        <input id="s_blur" type="range" min="0" max="8" step="1" value="1"/>
+      </div>
+      <div>
+        <label>Temporal Smoothing <span id="lab_alpha">0.25</span></label>
+        <input id="s_alpha" type="range" min="0" max="1" step="0.05" value="0.25"/>
+        <div class="small">Lower = smoother but laggier</div>
+      </div>
+      <div>
+        <label>Fill Gaps <span id="lab_dilate">1</span></label>
+        <input id="s_dilate" type="range" min="0" max="2" step="1" value="1"/>
+        <div class="small">Expands the mask slightly</div>
+      </div>
+    </div>
+
+    <div class="param-group">
+      <h3>Performance</h3>
+      <div>
+        <label>Target Segmentation FPS: <input id="segFps" type="number" min="5" max="30" value="12" style="width:70px"/></label>
+      </div>
+    </div>
+
+    <div style="margin-top:10px">
+      <label class="small">Output Preview</label>
+      <video id="outPreview" autoplay playsinline muted></video>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ------------- Performance Presets ------------- */
+const PRESETS = {
+  fast:     { MASK_W: 96,  MASK_H: 96,  OUTPUT_STRIDE: 16, BLUR: 0, segFps: 20 },
+  balanced: { MASK_W: 160, MASK_H: 160, OUTPUT_STRIDE: 16, BLUR: 0, segFps: 15 },
+  quality:  { MASK_W: 224, MASK_H: 224, OUTPUT_STRIDE: 8,  BLUR: 0, segFps: 12 },
+  ultra:    { MASK_W: 320, MASK_H: 240, OUTPUT_STRIDE: 8,  BLUR: 1, segFps: 8 }  // Новый пресет Ultra Quality
+};
+
+/* Данные сотрудника */
+let employeeData = {
+  "employee": {
+    "full_name": "Иванов Сергей Петрович",
+    "position": "Ведущий инженер по компьютерному зрению",
+    "company": "ООО «Рога и Копыта»",
+    "department": "Департамент компьютерного зрения",
+    "office_location": "Новосибирск, технопарк «Идея»",
+    "contact": {
+      "email": "sergey.ivanov@t1dp.ru",
+      "telegram": "@sergey_vision"
+    },
+    "branding": {
+      "corporate_colors": {
+        "primary": "#0052CC",
+        "secondary": "#00B8D9"
+      },
+      "slogan": "Инновации в каждый кадр"
+    },
+    "privacy_level": "medium"
+  }
+};
+
+/* UI Elements */
+const video = document.getElementById('video');
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
+const outPreview = document.getElementById('outPreview');
+const loadingEl = document.getElementById('loading');
+const fpsEl = document.getElementById('fps');
+const latencyEl = document.getElementById('latency');
+
+const presetSelect = document.getElementById('preset');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const outputBtn = document.getElementById('outputBtn');
+const privacyLevelSelect = document.getElementById('privacyLevel');
+const jsonInput = document.getElementById('jsonInput');
+const updateBgBtn = document.getElementById('updateBgBtn');
+
+const s_thresh = document.getElementById('s_thresh');
+const s_blur = document.getElementById('s_blur');
+const s_feather = document.getElementById('s_feather');
+const s_alpha = document.getElementById('s_alpha');
+const s_dilate = document.getElementById('s_dilate');
+const lab_thresh = document.getElementById('lab_thresh');
+const lab_blur = document.getElementById('lab_blur');
+const lab_feather = document.getElementById('lab_feather');
+const lab_alpha = document.getElementById('lab_alpha');
+const lab_dilate = document.getElementById('lab_dilate');
+const segFpsInput = document.getElementById('segFps');
+
+/* Parameters */
+let SEG_CONFIG = {};
+let BINARY_THRESH = Number(s_thresh.value);
+let BLUR_FACTOR = Number(s_blur.value);
+let FEATHER_PX = Number(s_feather.value);
+let TEMPORAL_ALPHA = Number(s_alpha.value);
+let DILATE_RADIUS = Number(s_dilate.value);
+let segIntervalMs = 1000 / Number(segFpsInput.value);
+
+/* Background */
+let backgroundImage = new Image();
+
+/* State */
+let segmenter = null;
+let running = false;
+let procCanvas, procCtx, maskCanvas, maskCtx, blurCanvas, blurCtx, finalCanvas, finalCtx;
+let personCanvas, personCtx;
+let accumFloat = null;
+let lastMaskAvailable = false;
+let frameTimes = [];
+let recentSegTimes = [];
+let frameCount = 0;
+
+const PREPROCESS = {
+  targetLuma: 160,
+  minGain: 0.75,
+  maxGain: 1.25,
+  colorBalanceStrength: 0.3,
+  smoothMix: 0.35
+};
+
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+
+/* === Вспомогательные функции === */
+function getAlphaArray(imgData){
+  const d = imgData.data;
+  const out = new Uint8ClampedArray(d.length / 4);
+  for(let i = 0, j = 0; i < d.length; i += 4, j++) {
+    out[j] = d[i + 3];
+  }
+  return out;
+}
+
+function alphaToImageData(alphaArr, w, h){
+  const out = new ImageData(w, h);
+  for(let i = 0, j = 0; j < alphaArr.length; i += 4, j++){
+    out.data[i] = 255; out.data[i + 1] = 255; out.data[i + 2] = 255; out.data[i + 3] = alphaArr[j];
+  }
+  return out;
+}
+
+function medianFilter(alphaArr, w, h){
+  const out = new Uint8ClampedArray(alphaArr.length);
+  for(let y = 0; y < h; y++){
+    for(let x = 0; x < w; x++){
+      let positives = 0;
+      let total = 0;
+      for(let dy = -1; dy <= 1; dy++){
+        const yy = y + dy;
+        if(yy < 0 || yy >= h) continue;
+        for(let dx = -1; dx <= 1; dx++){
+          const xx = x + dx;
+          if(xx < 0 || xx >= w) continue;
+          const val = alphaArr[yy * w + xx];
+          if(val > 0) positives++;
+          total++;
+        }
+      }
+      const idx = y * w + x;
+      out[idx] = positives >= Math.ceil(total / 2) ? 255 : 0;
+    }
+  }
+  return out;
+}
+
+function dilate(alphaArr, w, h, r){
+  if(r <= 0) return alphaArr;
+  const out = new Uint8ClampedArray(alphaArr.length);
+  for(let y = 0; y < h; y++){
+    for(let x = 0; x < w; x++){
+      let idx = y * w + x;
+      let found = false;
+      for(let dy = -r; dy <= r && !found; dy++){
+        const yy = y + dy;
+        if(yy < 0 || yy >= h) continue;
+        for(let dx = -r; dx <= r; dx++){
+          const xx = x + dx;
+          if(xx < 0 || xx >= w) continue;
+          if(alphaArr[yy * w + xx] > 0){
+            found = true;
+            break;
+          }
+        }
+      }
+      out[idx] = found ? 255 : 0;
+    }
+  }
+  return out;
+}
+
+function erode(alphaArr, w, h, r){
+  if(r <= 0) return alphaArr;
+  const out = new Uint8ClampedArray(alphaArr.length);
+  for(let y = 0; y < h; y++){
+    for(let x = 0; x < w; x++){
+      let keep = true;
+      for(let dy = -r; dy <= r && keep; dy++){
+        const yy = y + dy;
+        if(yy < 0 || yy >= h) continue;
+        for(let dx = -r; dx <= r; dx++){
+          const xx = x + dx;
+          if(xx < 0 || xx >= w) continue;
+          if(alphaArr[yy * w + xx] === 0){
+            keep = false;
+            break;
+          }
+        }
+      }
+      out[y * w + x] = keep ? 255 : 0;
+    }
+  }
+  return out;
+}
+
+function combineMask(binary, w, h, blurPx){
+  finalCtx.putImageData(alphaToImageData(binary, w, h), 0, 0);
+  blurCtx.clearRect(0, 0, w, h);
+  if (blurPx > 0) {
+    blurCtx.filter = `blur(${blurPx}px)`;
+    blurCtx.drawImage(finalCanvas, 0, 0);
+    blurCtx.filter = 'none';
+    const blurred = getAlphaArray(blurCtx.getImageData(0, 0, w, h));
+    const out = new Uint8ClampedArray(binary.length);
+    for(let i = 0; i < out.length; i++) {
+      out[i] = Math.max(binary[i], blurred[i]);
+    }
+    return out;
+  }
+  return binary;
+}
+
+function preprocessFrame(ctx, w, h){
+  const imageData = ctx.getImageData(0, 0, w, h);
+  normalizeLighting(imageData);
+  smoothImage(imageData, w, h, PREPROCESS.smoothMix);
+  ctx.putImageData(imageData, 0, 0);
+}
+
+function normalizeLighting(imageData){
+  const data = imageData.data;
+  const pixels = data.length / 4;
+  if (!pixels) return imageData;
+  let sumLum = 0, sumR = 0, sumG = 0, sumB = 0;
+  for (let i = 0; i < data.length; i += 4){
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    sumLum += 0.299 * r + 0.587 * g + 0.114 * b;
+    sumR += r; sumG += g; sumB += b;
+  }
+  const avgLum = sumLum / pixels;
+  let gain = clamp(PREPROCESS.targetLuma / (avgLum + 1e-3), PREPROCESS.minGain, PREPROCESS.maxGain);
+  const avgR = sumR / pixels;
+  const avgG = sumG / pixels;
+  const avgB = sumB / pixels;
+  const avgGray = (avgR + avgG + avgB) / 3;
+  const balance = PREPROCESS.colorBalanceStrength;
+  const rGain = clamp(1 + (avgGray - avgR) / (avgGray + 1e-3) * balance, 0.85, 1.15);
+  const gGain = clamp(1 + (avgGray - avgG) / (avgGray + 1e-3) * balance, 0.85, 1.15);
+  const bGain = clamp(1 + (avgGray - avgB) / (avgGray + 1e-3) * balance, 0.85, 1.15);
+  const gamma = avgLum < 110 ? 0.88 : avgLum > 175 ? 1.08 : 1.0;
+
+  for (let i = 0; i < data.length; i += 4){
+    let r = data[i] * gain * rGain;
+    let g = data[i + 1] * gain * gGain;
+    let b = data[i + 2] * gain * bGain;
+
+    r = Math.pow(clamp(r / 255, 0, 1), gamma) * 255;
+    g = Math.pow(clamp(g / 255, 0, 1), gamma) * 255;
+    b = Math.pow(clamp(b / 255, 0, 1), gamma) * 255;
+
+    data[i] = clamp(r, 0, 255);
+    data[i + 1] = clamp(g, 0, 255);
+    data[i + 2] = clamp(b, 0, 255);
+  }
+  return imageData;
+}
+
+function smoothImage(imageData, w, h, mix){
+  if (mix <= 0) return imageData;
+  const src = imageData.data;
+  const copy = new Uint8ClampedArray(src);
+  const kernel = [1, 2, 1, 2, 4, 2, 1, 2, 1];
+  for(let y = 0; y < h; y++){
+    for(let x = 0; x < w; x++){
+      let rAcc = 0, gAcc = 0, bAcc = 0, weightAcc = 0;
+      for(let ky = -1; ky <= 1; ky++){
+        const yy = y + ky;
+        if(yy < 0 || yy >= h) continue;
+        for(let kx = -1; kx <= 1; kx++){
+          const xx = x + kx;
+          if(xx < 0 || xx >= w) continue;
+          const weight = kernel[(ky + 1) * 3 + (kx + 1)];
+          const idx = (yy * w + xx) * 4;
+          rAcc += copy[idx] * weight;
+          gAcc += copy[idx + 1] * weight;
+          bAcc += copy[idx + 2] * weight;
+          weightAcc += weight;
+        }
+      }
+      const idx = (y * w + x) * 4;
+      const rBlur = rAcc / weightAcc;
+      const gBlur = gAcc / weightAcc;
+      const bBlur = bAcc / weightAcc;
+      src[idx] = clamp(copy[idx] * (1 - mix) + rBlur * mix, 0, 255);
+      src[idx + 1] = clamp(copy[idx + 1] * (1 - mix) + gBlur * mix, 0, 255);
+      src[idx + 2] = clamp(copy[idx + 2] * (1 - mix) + bBlur * mix, 0, 255);
+    }
+  }
+  return imageData;
+}
+
+/* === Генерация фона === */
+async function generatePersonalizedBackground() {
+  const width = canvas.width;
+  const height = canvas.height;
+  const tempCanvas = document.createElement('canvas');
+  tempCanvas.width = width;
+  tempCanvas.height = height;
+  const tempCtx = tempCanvas.getContext('2d');
+
+  const data = employeeData.employee;
+  const privacy = privacyLevelSelect.value;
+
+  const { primary, secondary } = data.branding.corporate_colors;
+  const grad = tempCtx.createLinearGradient(0, 0, width, height);
+  grad.addColorStop(0, primary);
+  grad.addColorStop(1, secondary);
+  tempCtx.fillStyle = grad;
+  tempCtx.fillRect(0, 0, width, height);
+
+  tempCtx.fillStyle = '#fff';
+  tempCtx.font = 'bold 16px Arial';
+  let y = 20;
+  tempCtx.fillText(data.full_name, 15, y); y += 22;
+  tempCtx.fillText(data.position, 15, y); y += 22;
+
+  if (privacy !== 'low') {
+    tempCtx.fillText(data.company, 15, y); y += 22;
+    tempCtx.fillText(data.department, 15, y); y += 22;
+    tempCtx.fillText(data.office_location, 15, y); y += 22;
+  }
+
+  if (privacy === 'high') {
+    tempCtx.font = '14px Arial';
+    tempCtx.fillText(data.contact.email, 15, y); y += 20;
+    tempCtx.fillText(data.contact.telegram, 15, y); y += 20;
+    tempCtx.fillText(data.branding.slogan, 15, y); y += 25;
+
+    const qrCanvas = document.createElement('canvas');
+    await new Promise(resolve => {
+      QRCode.toCanvas(qrCanvas, data.contact.email, { width: 50 }, () => {
+        tempCtx.drawImage(qrCanvas, width - 65, height - 65, 50, 50);
+        resolve();
+      });
+    });
+  }
+
+  backgroundImage.src = tempCanvas.toDataURL();
+  await new Promise(resolve => {
+    backgroundImage.onload = resolve;
+    backgroundImage.onerror = resolve;
+  });
+}
+
+async function updateBackgroundFromData() {
+  try {
+    const text = jsonInput.value.trim();
+    if (text) employeeData = JSON.parse(text);
+    await generatePersonalizedBackground();
+  } catch (err) {
+    alert('Ошибка JSON: ' + err.message);
+  }
+}
+
+/* === Инициализация канвасов === */
+function setSEGConfigFromPreset(name){
+  const p = PRESETS[name];
+  SEG_CONFIG.MASK_W = p.MASK_W;
+  SEG_CONFIG.MASK_H = p.MASK_H;
+  SEG_CONFIG.OUTPUT_STRIDE = p.OUTPUT_STRIDE;
+  SEG_CONFIG.BLUR = p.BLUR;
+  SEG_CONFIG.targetSegFps = p.segFps;
+  s_blur.value = p.BLUR;
+  lab_blur.textContent = p.BLUR;
+  segFpsInput.value = p.segFps;
+  segIntervalMs = 1000 / p.segFps;
+}
+
+function initCanvases(){
+  const w = SEG_CONFIG.MASK_W, h = SEG_CONFIG.MASK_H;
+
+  procCanvas = document.createElement('canvas'); procCanvas.width = w; procCanvas.height = h;
+  procCtx = procCanvas.getContext('2d', { willReadFrequently: true });
+
+  maskCanvas = document.createElement('canvas'); maskCanvas.width = w; maskCanvas.height = h;
+  maskCtx = maskCanvas.getContext('2d');
+
+  blurCanvas = document.createElement('canvas'); blurCanvas.width = w; blurCanvas.height = h;
+  blurCtx = blurCanvas.getContext('2d');
+
+  finalCanvas = document.createElement('canvas'); finalCanvas.width = w; finalCanvas.height = h;
+  finalCtx = finalCanvas.getContext('2d');
+
+  personCanvas = document.createElement('canvas');
+  personCanvas.width = canvas.width; personCanvas.height = canvas.height;
+  personCtx = personCanvas.getContext('2d', { willReadFrequently: true });
+
+  accumFloat = new Float32Array(w * h);
+  accumFloat.fill(0);
+  lastMaskAvailable = false;
+}
+
+/* === Сегментация === */
+async function runSegmentationOnce(){
+  const w = SEG_CONFIG.MASK_W, h = SEG_CONFIG.MASK_H;
+
+  procCtx.clearRect(0, 0, w, h);
+  procCtx.drawImage(video, 0, 0, w, h);
+  preprocessFrame(procCtx, w, h);
+
+  if (!segmenter) return;
+
+  const t0 = performance.now();
+  const segmentation = await segmenter.segmentPeople(procCanvas, {
+    flipHorizontal: false,
+    multiSegmentation: false,
+    segmentBodyParts: false
+  });
+  const t1 = performance.now();
+
+  const latency = Math.round(t1 - t0);
+  latencyEl.textContent = latency;
+  recentSegTimes.push(latency);
+  if (recentSegTimes.length > 8) recentSegTimes.shift();
+
+  if (segmentation && segmentation.length > 0){
+    const maskImg = await bodySegmentation.toBinaryMask(
+      segmentation[0],
+      { r: 255, g: 255, b: 255, a: 255 },
+      { r: 0, g: 0, b: 0, a: 0 }
+    );
+
+    maskCtx.putImageData(maskImg, 0, 0);
+    let binAlpha = getAlphaArray(maskImg);
+
+    for (let i = 0; i < binAlpha.length; i++) {
+      binAlpha[i] = (binAlpha[i] >= BINARY_THRESH) ? 255 : 0;
+    }
+
+    const denoised = medianFilter(binAlpha, w, h);
+    const dilated = DILATE_RADIUS > 0 ? dilate(denoised, w, h, DILATE_RADIUS) : denoised;
+    const refined = DILATE_RADIUS > 0 ? erode(dilated, w, h, 1) : dilated;
+    const combined = BLUR_FACTOR > 0 ? combineMask(refined, w, h, BLUR_FACTOR) : refined;
+
+    for (let i = 0; i < combined.length; i++){
+      const cur = combined[i] / 255;
+      accumFloat[i] = accumFloat[i] * (1 - TEMPORAL_ALPHA) + cur * TEMPORAL_ALPHA;
+    }
+
+    const outAlpha = new Uint8ClampedArray(accumFloat.length);
+    for (let i = 0; i < outAlpha.length; i++) {
+      outAlpha[i] = Math.round(Math.max(0, Math.min(1, accumFloat[i])) * 255);
+    }
+
+    finalCtx.putImageData(alphaToImageData(outAlpha, w, h), 0, 0);
+    compositeFinalResult();
+    lastMaskAvailable = true;
+  } else {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    lastMaskAvailable = false;
+  }
+}
+
+function compositeFinalResult(){
+  const vw = canvas.width, vh = canvas.height;
+
+  ctx.clearRect(0, 0, vw, vh);
+  if (backgroundImage.complete && backgroundImage.naturalWidth !== 0) {
+    ctx.drawImage(backgroundImage, 0, 0, vw, vh);
+  } else {
+    ctx.fillStyle = '#0052CC';
+    ctx.fillRect(0, 0, vw, vh);
+  }
+
+  personCtx.clearRect(0, 0, vw, vh);
+  personCtx.drawImage(video, 0, 0, vw, vh);
+
+  personCtx.save();
+  personCtx.globalCompositeOperation = 'destination-in';
+  personCtx.imageSmoothingEnabled = true;
+  personCtx.imageSmoothingQuality = 'high';
+  if (FEATHER_PX > 0) personCtx.filter = `blur(${FEATHER_PX}px)`;
+  personCtx.drawImage(finalCanvas, 0, 0, vw, vh);
+  personCtx.filter = 'none';
+  personCtx.restore();
+
+  ctx.drawImage(personCanvas, 0, 0);
+}
+
+/* === Цикл === */
+const adaptive = {
+  targetMs: 1000 / Number(segFpsInput.value),
+  skipFrames: 1,
+  adjust() {
+    if (recentSegTimes.length === 0) return;
+    const avg = recentSegTimes.reduce((a, b) => a + b, 0) / recentSegTimes.length;
+    if (avg > this.targetMs * 0.95 && this.skipFrames < 8) this.skipFrames++;
+    if (avg < this.targetMs * 0.6 && this.skipFrames > 1) this.skipFrames--;
+  }
+};
+
+function scheduleLoop(){
+  if (!running) return;
+
+  const handler = async () => {
+    frameCount++;
+    const shouldRun = (frameCount % adaptive.skipFrames) === 0;
+
+    if (shouldRun) {
+      await runSegmentationOnce();
+      adaptive.adjust();
+    } else if (lastMaskAvailable) {
+      compositeFinalResult();
+    } else {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    }
+
+    frameTimes.push(performance.now());
+    if(frameTimes.length > 12) frameTimes.shift();
+    if(frameTimes.length >= 2){
+      const fps = 1000 * (frameTimes.length - 1) / (frameTimes[frameTimes.length - 1] - frameTimes[0]);
+      fpsEl.textContent = fps.toFixed(1);
+    }
+
+    if ('requestVideoFrameCallback' in video) {
+      video.requestVideoFrameCallback(handler);
+    } else {
+      requestAnimationFrame(handler);
+    }
+  };
+
+  if ('requestVideoFrameCallback' in video) {
+    video.requestVideoFrameCallback(handler);
+  } else {
+    requestAnimationFrame(handler);
+  }
+}
+
+/* === Инициализация === */
+async function init(){
+  loadingEl.textContent = 'Requesting camera...';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, frameRate: { ideal: 30 } },
+      audio: false
+    });
+
+    video.srcObject = stream;
+    await new Promise(r => video.onloadedmetadata = r);
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+
+    setSEGConfigFromPreset(presetSelect.value);
+    initCanvases();
+
+    loadingEl.textContent = 'Loading model...';
+
+    let backend = 'webgl';
+    if (tf.env().get('WEBGL_VERSION') === 0) backend = 'cpu';
+    try {
+      await tf.setBackend(backend);
+    } catch (err) {
+      console.warn(`Failed to set backend ${backend}:`, err);
+      backend = 'cpu';
+      await tf.setBackend('cpu');
+    }
+    await tf.ready();
+    console.log(`✅ TensorFlow backend: ${tf.getBackend()}`);
+
+    const model = bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation;
+    segmenter = await bodySegmentation.createSegmenter(model, {
+      runtime: 'tfjs',
+      modelType: 'landscape',  // Улучшение для Ultra
+      segmentationThreshold: 0.7,  // Улучшение для Ultra
+      segmentationMaskSize: { width: SEG_CONFIG.MASK_W, height: SEG_CONFIG.MASK_H },
+      outputStride: SEG_CONFIG.OUTPUT_STRIDE
+    });
+
+    jsonInput.value = JSON.stringify(employeeData, null, 2);
+    await updateBackgroundFromData();
+
+    loadingEl.style.display = 'none';
+  } catch(e) {
+    loadingEl.textContent = 'Error: ' + e.message;
+    console.error(e);
+  }
+}
+
+/* === UI === */
+startBtn.onclick = async () => {
+  if (!segmenter) { alert('Model not loaded'); return; }
+  setSEGConfigFromPreset(presetSelect.value);
+  BINARY_THRESH = Number(s_thresh.value);
+  BLUR_FACTOR = Number(s_blur.value);
+  FEATHER_PX = Number(s_feather.value);
+  TEMPORAL_ALPHA = Number(s_alpha.value);
+  DILATE_RADIUS = Number(s_dilate.value);
+  adaptive.targetMs = 1000 / Number(segFpsInput.value);
+
+  initCanvases();
+  await updateBackgroundFromData();
+  running = true;
+  scheduleLoop();
+};
+
+stopBtn.onclick = () => { running = false; };
+updateBgBtn.onclick = updateBackgroundFromData;
+privacyLevelSelect.onchange = updateBackgroundFromData;
+
+s_thresh.oninput = () => { BINARY_THRESH = Number(s_thresh.value); lab_thresh.textContent = BINARY_THRESH; };
+s_blur.oninput = () => { BLUR_FACTOR = Number(s_blur.value); lab_blur.textContent = BLUR_FACTOR; };
+s_feather.oninput = () => { FEATHER_PX = Number(s_feather.value); lab_feather.textContent = FEATHER_PX; };
+s_alpha.oninput = () => { TEMPORAL_ALPHA = Number(s_alpha.value); lab_alpha.textContent = TEMPORAL_ALPHA.toFixed(2); };
+s_dilate.oninput = () => { DILATE_RADIUS = Number(s_dilate.value); lab_dilate.textContent = DILATE_RADIUS; };
+segFpsInput.onchange = () => { adaptive.targetMs = 1000 / Number(segFpsInput.value); };
+presetSelect.onchange = () => { setSEGConfigFromPreset(presetSelect.value); initCanvases(); };
+outputBtn.onclick = () => {
+  if (outPreview.srcObject) {
+    outPreview.srcObject.getTracks().forEach(t => t.stop());
+    outPreview.srcObject = null;
+    outputBtn.textContent = 'Start Output Stream';
+  } else {
+    outPreview.srcObject = canvas.captureStream(30);
+    outputBtn.textContent = 'Stop Output Stream';
+  }
+};
+
+init();
+</script>
+</body>
+</html>

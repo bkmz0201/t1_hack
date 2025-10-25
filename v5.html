@@ -1,0 +1,853 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<title>Video Segmentation — Ultra Quality</title>
+<style>
+  body{font-family:Arial,Helvetica,sans-serif;margin:18px;background:#f6f7fb;color:#111}
+  h1{margin:0 0 12px}
+  #panes{display:flex;gap:20px}
+  #left{width:360px}
+  #video,#canvas,#outPreview{width:320px;height:240px;border:1px solid #ccc;display:block;margin-bottom:10px;background:#000}
+  label{display:block;margin:6px 0;font-size:13px}
+  .row{display:flex;gap:8px;align-items:center}
+  .small{font-size:12px;color:#666}
+  input[type=range]{width:220px}
+  button{padding:8px 14px;border-radius:6px;border:none;background:#0052CC;color:#fff;cursor:pointer}
+  button.secondary{background:#e6eefc;color:#0052CC}
+  button:disabled{background:#ccc;cursor:not-allowed}
+  select{padding:6px;border-radius:6px}
+  #status{margin-top:8px;font-size:13px}
+  .param-group{margin-bottom:15px;padding:10px;background:#fff;border-radius:8px;border:1px solid #e1e5e9}
+  .param-group h3{margin:0 0 8px 0;font-size:14px;color:#0052CC}
+  #backgroundControls{margin-top:15px;padding:10px;background:#e6f7ff;border-radius:8px;border:1px solid #b3e0ff}
+  textarea{width:100%;height:120px;padding:8px;border:1px solid #ccc;border-radius:6px;font-family:monospace;font-size:11px}
+  .warning{color:#d32f2f;font-size:12px;margin-top:5px}
+  .success{color:#388e3c;font-size:12px;margin-top:5px}
+  .info{color:#1976d2;font-size:12px;margin-top:5px}
+</style>
+
+<!-- TensorFlow.js -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+
+<!-- BodyPix с альтернативным CDN -->
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.1/dist/body-pix.min.js"></script>
+
+<!-- QRCode -->
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head>
+
+<body>
+<h1>Video Segmentation — Ultra Quality</h1>
+<p class="info" id="memoryStatus">Инициализация...</p>
+
+<div id="panes">
+  <div id="left">
+    <div id="loading">Загрузка компонентов...</div>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="row">
+      <button id="startBtn" disabled>Start</button>
+      <button id="stopBtn" class="secondary" disabled>Stop</button>
+      <button id="cleanupBtn" class="secondary">🧹 Очистить память</button>
+    </div>
+
+    <div class="row">
+      <button id="outputBtn" class="secondary" disabled>Start Output Stream</button>
+    </div>
+
+    <div id="status" class="small">
+      FPS: <span id="fps">0</span> · 
+      Latency: <span id="latency">0</span> ms · 
+      Тензоров: <span id="tensors">0</span>
+    </div>
+    
+    <div style="margin-top:8px">
+      <label>Performance Preset:
+        <select id="preset">
+          <option value="fast">Fast (96px)</option>
+          <option value="balanced">Balanced (160px)</option>
+          <option value="quality">Quality (224px)</option>
+          <option value="ultra" selected>Ultra Quality (320px)</option>
+        </select>
+      </label>
+    </div>
+
+    <div id="backgroundControls">
+      <label>Privacy Level:
+        <select id="privacyLevel">
+          <option value="low">Low</option>
+          <option value="medium" selected>Medium</option>
+          <option value="high">High</option>
+        </select>
+      </label>
+
+      <div style="margin-top:10px">
+        <textarea id="jsonInput" placeholder='Вставьте JSON сотрудника'></textarea>
+      </div>
+      <div style="margin-top:8px">
+        <button id="updateBgBtn" class="secondary">Update Background</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="param-group">
+      <h3>Segmentation Quality</h3>
+      <div>
+        <label>Model Confidence <span id="lab_thresh">180</span></label>
+        <input id="s_thresh" type="range" min="50" max="255" step="1" value="180"/>
+        <div class="small">Ниже = лучше для рук</div>
+      </div>
+      <div>
+        <label>Edge Smoothing <span id="lab_feather">6</span>px</label>
+        <input id="s_feather" type="range" min="0" max="15" step="1" value="6"/>
+        <div class="small">Размытие краёв</div>
+      </div>
+    </div>
+
+    <div class="param-group">
+      <h3>Advanced Settings</h3>
+      <div>
+        <label>Mask Smoothing <span id="lab_blur">1</span></label>
+        <input id="s_blur" type="range" min="0" max="5" step="1" value="1"/>
+        <div class="small">Сглаживание маски</div>
+      </div>
+      <div>
+        <label>Temporal Smoothing <span id="lab_alpha">0.4</span></label>
+        <input id="s_alpha" type="range" min="0" max="1" step="0.05" value="0.4"/>
+        <div class="small">Плавность между кадрами</div>
+      </div>
+      <div>
+        <label>Fill Gaps <span id="lab_dilate">1</span></label>
+        <input id="s_dilate" type="range" min="0" max="3" step="1" value="1"/>
+        <div class="small">Заполнение дыр в маске</div>
+      </div>
+    </div>
+
+    <div class="param-group">
+      <h3>Performance</h3>
+      <div>
+        <label>Target FPS: <input id="segFps" type="number" min="3" max="15" value="8" style="width:70px"/></label>
+      </div>
+    </div>
+
+    <div style="margin-top:10px">
+      <label class="small">Output Preview</label>
+      <video id="outPreview" autoplay playsinline muted></video>
+    </div>
+  </div>
+</div>
+
+<script>
+class VideoSegmentation {
+  constructor() {
+    this.PRESETS = {
+      fast:     { MASK_W: 96,  MASK_H: 72,  OUTPUT_STRIDE: 32, segFps: 15 },
+      balanced: { MASK_W: 160, MASK_H: 120, OUTPUT_STRIDE: 16, segFps: 12 },
+      quality:  { MASK_W: 224, MASK_H: 168, OUTPUT_STRIDE: 16, segFps: 10 },
+      ultra:    { MASK_W: 320, MASK_H: 240, OUTPUT_STRIDE: 16, segFps: 8 }
+    };
+
+    this.employeeData = {
+      "employee": {
+        "full_name": "Иванов Сергей Петрович",
+        "position": "Ведущий инженер по компьютерному зрению",
+        "company": "ООО «Рога и Копыта»",
+        "department": "Департамент компьютерного зрения",
+        "office_location": "Новосибирск, технопарк «Идея»",
+        "contact": {
+          "email": "sergey.ivanov@t1dp.ru",
+          "telegram": "@sergey_vision"
+        },
+        "branding": {
+          "corporate_colors": {
+            "primary": "#0052CC",
+            "secondary": "#00B8D9"
+          },
+          "slogan": "Инновации в каждый кадр"
+        },
+        "privacy_level": "medium"
+      }
+    };
+
+    this.initElements();
+    this.initState();
+  }
+
+  initElements() {
+    // Основные элементы
+    this.video = document.getElementById('video');
+    this.canvas = document.getElementById('canvas');
+    this.ctx = this.canvas.getContext('2d');
+    this.loadingEl = document.getElementById('loading');
+    this.fpsEl = document.getElementById('fps');
+    this.latencyEl = document.getElementById('latency');
+    this.tensorsEl = document.getElementById('tensors');
+    this.memoryStatus = document.getElementById('memoryStatus');
+    
+    // Кнопки
+    this.startBtn = document.getElementById('startBtn');
+    this.stopBtn = document.getElementById('stopBtn');
+    this.cleanupBtn = document.getElementById('cleanupBtn');
+    this.outputBtn = document.getElementById('outputBtn');
+    this.updateBgBtn = document.getElementById('updateBgBtn');
+    
+    // Настройки
+    this.presetSelect = document.getElementById('preset');
+    this.privacyLevelSelect = document.getElementById('privacyLevel');
+    this.jsonInput = document.getElementById('jsonInput');
+    
+    // Слайдеры
+    this.s_thresh = document.getElementById('s_thresh');
+    this.s_blur = document.getElementById('s_blur');
+    this.s_feather = document.getElementById('s_feather');
+    this.s_alpha = document.getElementById('s_alpha');
+    this.s_dilate = document.getElementById('s_dilate');
+    this.segFpsInput = document.getElementById('segFps');
+    
+    // Лейблы
+    this.lab_thresh = document.getElementById('lab_thresh');
+    this.lab_blur = document.getElementById('lab_blur');
+    this.lab_feather = document.getElementById('lab_feather');
+    this.lab_alpha = document.getElementById('lab_alpha');
+    this.lab_dilate = document.getElementById('lab_dilate');
+  }
+
+  initState() {
+    this.net = null;
+    this.running = false;
+    this.backgroundImage = new Image();
+    this.frameTimes = [];
+    this.recentSegTimes = [];
+    this.frameCount = 0;
+    
+    // Параметры
+    this.SEG_CONFIG = {};
+    this.BINARY_THRESH = 180;
+    this.BLUR_FACTOR = 1;
+    this.FEATHER_PX = 6;
+    this.TEMPORAL_ALPHA = 0.4;
+    this.DILATE_RADIUS = 1;
+    
+    // Canvas элементы
+    this.procCanvas = null;
+    this.procCtx = null;
+    this.finalCanvas = null;
+    this.finalCtx = null;
+    this.personCanvas = null;
+    this.personCtx = null;
+    
+    this.accumFloat = null;
+    this.lastMaskAvailable = false;
+    
+    this.adaptive = {
+      targetMs: 1000 / 8,
+      skipFrames: 1,
+      recentSegTimes: [],
+      adjust() {
+        if (this.recentSegTimes.length === 0) return;
+        const avg = this.recentSegTimes.reduce((a, b) => a + b, 0) / this.recentSegTimes.length;
+        if (avg > this.targetMs * 0.9 && this.skipFrames < 10) this.skipFrames++;
+        if (avg < this.targetMs * 0.7 && this.skipFrames > 1) this.skipFrames--;
+      }
+    };
+  }
+
+  // Утилиты
+  clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+  getAlphaArray(imgData) {
+    const d = imgData.data;
+    const out = new Uint8ClampedArray(d.length / 4);
+    for(let i = 0, j = 0; i < d.length; i += 4, j++) {
+      out[j] = d[i + 3];
+    }
+    return out;
+  }
+
+  alphaToImageData(alphaArr, w, h) {
+    const out = new ImageData(w, h);
+    for(let i = 0, j = 0; j < alphaArr.length; i += 4, j++) {
+      out.data[i] = 255; 
+      out.data[i + 1] = 255; 
+      out.data[i + 2] = 255; 
+      out.data[i + 3] = alphaArr[j];
+    }
+    return out;
+  }
+
+  // Обработка маски
+  processMask(binary, w, h) {
+    // Медианный фильтр для удаления шума
+    const denoised = this.medianFilter(binary, w, h);
+    
+    // Расширение для заполнения дыр
+    const dilated = this.dilate(denoised, w, h, this.DILATE_RADIUS);
+    
+    // Легкое сужение для сохранения формы
+    const refined = this.DILATE_RADIUS > 0 ? this.erode(dilated, w, h, 1) : dilated;
+    
+    return refined;
+  }
+
+  medianFilter(alphaArr, w, h) {
+    const out = new Uint8ClampedArray(alphaArr.length);
+    for(let y = 0; y < h; y++) {
+      for(let x = 0; x < w; x++) {
+        let positives = 0;
+        let total = 0;
+        for(let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if(yy < 0 || yy >= h) continue;
+          for(let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if(xx < 0 || xx >= w) continue;
+            const val = alphaArr[yy * w + xx];
+            if(val > 128) positives++;
+            total++;
+          }
+        }
+        const idx = y * w + x;
+        out[idx] = positives >= Math.ceil(total / 2) ? 255 : 0;
+      }
+    }
+    return out;
+  }
+
+  dilate(alphaArr, w, h, r) {
+    if(r <= 0) return alphaArr;
+    const out = new Uint8ClampedArray(alphaArr.length);
+    for(let y = 0; y < h; y++) {
+      for(let x = 0; x < w; x++) {
+        let found = false;
+        for(let dy = -r; dy <= r && !found; dy++) {
+          const yy = y + dy;
+          if(yy < 0 || yy >= h) continue;
+          for(let dx = -r; dx <= r; dx++) {
+            const xx = x + dx;
+            if(xx < 0 || xx >= w) continue;
+            if(alphaArr[yy * w + xx] > 128) {
+              found = true;
+              break;
+            }
+          }
+        }
+        out[y * w + x] = found ? 255 : 0;
+      }
+    }
+    return out;
+  }
+
+  erode(alphaArr, w, h, r) {
+    if(r <= 0) return alphaArr;
+    const out = new Uint8ClampedArray(alphaArr.length);
+    for(let y = 0; y < h; y++) {
+      for(let x = 0; x < w; x++) {
+        let keep = true;
+        for(let dy = -r; dy <= r && keep; dy++) {
+          const yy = y + dy;
+          if(yy < 0 || yy >= h) continue;
+          for(let dx = -r; dx <= r; dx++) {
+            const xx = x + dx;
+            if(xx < 0 || xx >= w) continue;
+            if(alphaArr[yy * w + xx] === 0) {
+              keep = false;
+              break;
+            }
+          }
+        }
+        out[y * w + x] = keep ? 255 : 0;
+      }
+    }
+    return out;
+  }
+
+  // Управление памятью
+  cleanupMemory() {
+    try {
+      const before = tf.memory().numTensors;
+      tf.disposeVariables();
+      const after = tf.memory().numTensors;
+      this.updateMemoryStats();
+      this.memoryStatus.textContent = `✅ Память очищена: ${before} -> ${after} тензоров`;
+      this.memoryStatus.className = 'success';
+    } catch (err) {
+      console.warn('Ошибка очистки памяти:', err);
+    }
+  }
+
+  updateMemoryStats() {
+    try {
+      const memory = tf.memory();
+      const memoryMB = Math.round(memory.numBytes / 1024 / 1024);
+      this.tensorsEl.textContent = memory.numTensors;
+      
+      if (memoryMB > 300) {
+        this.memoryStatus.textContent = `⚠️ Высокая память: ${memoryMB}MB`;
+        this.memoryStatus.className = 'warning';
+      } else if (memoryMB > 150) {
+        this.memoryStatus.textContent = `⚠️ Память: ${memoryMB}MB`;
+        this.memoryStatus.className = 'warning';
+      } else {
+        this.memoryStatus.textContent = `✅ Память: ${memoryMB}MB`;
+        this.memoryStatus.className = 'success';
+      }
+    } catch (e) {
+      this.memoryStatus.textContent = '❌ Не удалось получить статистику памяти';
+    }
+  }
+
+  // Основные функции
+  setSEGConfigFromPreset(name) {
+    const p = this.PRESETS[name];
+    this.SEG_CONFIG.MASK_W = p.MASK_W;
+    this.SEG_CONFIG.MASK_H = p.MASK_H;
+    this.SEG_CONFIG.OUTPUT_STRIDE = p.OUTPUT_STRIDE;
+    this.SEG_CONFIG.targetSegFps = p.segFps;
+    
+    this.segFpsInput.value = p.segFps;
+    this.adaptive.targetMs = 1000 / p.segFps;
+  }
+
+  initCanvases() {
+    const w = this.SEG_CONFIG.MASK_W, h = this.SEG_CONFIG.MASK_H;
+    
+    this.procCanvas = document.createElement('canvas');
+    this.procCanvas.width = w; this.procCanvas.height = h;
+    this.procCtx = this.procCanvas.getContext('2d');
+    
+    this.finalCanvas = document.createElement('canvas');
+    this.finalCanvas.width = w; this.finalCanvas.height = h;
+    this.finalCtx = this.finalCanvas.getContext('2d');
+    
+    this.personCanvas = document.createElement('canvas');
+    this.personCanvas.width = this.canvas.width;
+    this.personCanvas.height = this.canvas.height;
+    this.personCtx = this.personCanvas.getContext('2d');
+    
+    this.accumFloat = new Float32Array(w * h);
+    this.accumFloat.fill(0);
+    this.lastMaskAvailable = false;
+  }
+
+  async runSegmentationOnce() {
+    if (!this.net || !this.running) return;
+
+    const w = this.SEG_CONFIG.MASK_W, h = this.SEG_CONFIG.MASK_H;
+    
+    // Подготовка кадра
+    this.procCtx.clearRect(0, 0, w, h);
+    this.procCtx.drawImage(this.video, 0, 0, w, h);
+
+    const t0 = performance.now();
+    
+    try {
+      // Сегментация
+      const personSegmentation = await this.net.segmentPerson(this.procCanvas, {
+        flipHorizontal: false,
+        internalResolution: 'medium',
+        segmentationThreshold: 0.5,
+        maxDetections: 1
+      });
+
+      const t1 = performance.now();
+      const latency = Math.round(t1 - t0);
+      this.latencyEl.textContent = latency;
+      this.adaptive.recentSegTimes.push(latency);
+      if (this.adaptive.recentSegTimes.length > 8) this.adaptive.recentSegTimes.shift();
+
+      if (personSegmentation && personSegmentation.data) {
+        const maskData = personSegmentation.data;
+        const binAlpha = new Uint8ClampedArray(w * h);
+        
+        // Бинаризация
+        for (let i = 0; i < binAlpha.length; i++) {
+          binAlpha[i] = maskData[i] ? 255 : 0;
+        }
+
+        // Применение порога
+        for (let i = 0; i < binAlpha.length; i++) {
+          binAlpha[i] = binAlpha[i] >= this.BINARY_THRESH ? 255 : 0;
+        }
+
+        // Обработка маски
+        const processed = this.processMask(binAlpha, w, h);
+
+        // Временное сглаживание
+        for (let i = 0; i < processed.length; i++) {
+          const cur = processed[i] / 255;
+          this.accumFloat[i] = this.accumFloat[i] * (1 - this.TEMPORAL_ALPHA) + cur * this.TEMPORAL_ALPHA;
+        }
+
+        const outAlpha = new Uint8ClampedArray(this.accumFloat.length);
+        for (let i = 0; i < outAlpha.length; i++) {
+          outAlpha[i] = Math.round(this.clamp(this.accumFloat[i], 0, 1) * 255);
+        }
+
+        this.finalCtx.putImageData(this.alphaToImageData(outAlpha, w, h), 0, 0);
+        this.compositeFinalResult();
+        this.lastMaskAvailable = true;
+      }
+    } catch (error) {
+      console.error('Ошибка сегментации:', error);
+      this.fallbackRender();
+    }
+
+    this.updateMemoryStats();
+  }
+
+  compositeFinalResult() {
+    const vw = this.canvas.width, vh = this.canvas.height;
+    this.ctx.clearRect(0, 0, vw, vh);
+    
+    // Фон
+    if (this.backgroundImage.complete && this.backgroundImage.naturalWidth !== 0) {
+      this.ctx.drawImage(this.backgroundImage, 0, 0, vw, vh);
+    } else {
+      this.ctx.fillStyle = '#0052CC';
+      this.ctx.fillRect(0, 0, vw, vh);
+    }
+    
+    // Персона с маской
+    this.personCtx.clearRect(0, 0, vw, vh);
+    this.personCtx.drawImage(this.video, 0, 0, vw, vh);
+    this.personCtx.save();
+    this.personCtx.globalCompositeOperation = 'destination-in';
+    this.personCtx.imageSmoothingEnabled = true;
+    this.personCtx.imageSmoothingQuality = 'high';
+    
+    if (this.FEATHER_PX > 0) {
+      this.personCtx.filter = `blur(${this.FEATHER_PX}px)`;
+    }
+    
+    this.personCtx.drawImage(this.finalCanvas, 0, 0, vw, vh);
+    this.personCtx.filter = 'none';
+    this.personCtx.restore();
+    
+    this.ctx.drawImage(this.personCanvas, 0, 0);
+  }
+
+  fallbackRender() {
+    this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+    this.ctx.drawImage(this.video, 0, 0, this.canvas.width, this.canvas.height);
+    this.lastMaskAvailable = false;
+  }
+
+  scheduleLoop() {
+    if (!this.running) return;
+
+    const handler = async () => {
+      this.frameCount++;
+      const shouldRun = (this.frameCount % this.adaptive.skipFrames) === 0;
+      
+      if (shouldRun) {
+        await this.runSegmentationOnce();
+        this.adaptive.adjust();
+      } else if (this.lastMaskAvailable) {
+        this.compositeFinalResult();
+      } else {
+        this.fallbackRender();
+      }
+      
+      // FPS расчет
+      this.frameTimes.push(performance.now());
+      if(this.frameTimes.length > 12) this.frameTimes.shift();
+      if(this.frameTimes.length >= 2) {
+        const fps = 1000 * (this.frameTimes.length - 1) / (this.frameTimes[this.frameTimes.length - 1] - this.frameTimes[0]);
+        this.fpsEl.textContent = fps.toFixed(1);
+      }
+
+      if (this.running) {
+        if ('requestVideoFrameCallback' in this.video) {
+          this.video.requestVideoFrameCallback(handler);
+        } else {
+          requestAnimationFrame(handler);
+        }
+      }
+    };
+
+    if ('requestVideoFrameCallback' in this.video) {
+      this.video.requestVideoFrameCallback(handler);
+    } else {
+      requestAnimationFrame(handler);
+    }
+  }
+
+  async generatePersonalizedBackground() {
+    const width = this.canvas.width;
+    const height = this.canvas.height;
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = width;
+    tempCanvas.height = height;
+    const tempCtx = tempCanvas.getContext('2d');
+
+    const data = this.employeeData.employee;
+    const privacy = this.privacyLevelSelect.value;
+
+    const { primary, secondary } = data.branding.corporate_colors;
+    const grad = tempCtx.createLinearGradient(0, 0, width, height);
+    grad.addColorStop(0, primary);
+    grad.addColorStop(1, secondary);
+    tempCtx.fillStyle = grad;
+    tempCtx.fillRect(0, 0, width, height);
+
+    tempCtx.fillStyle = '#fff';
+    tempCtx.font = 'bold 16px Arial';
+    let y = 20;
+    tempCtx.fillText(data.full_name, 15, y); y += 22;
+    tempCtx.fillText(data.position, 15, y); y += 22;
+
+    if (privacy !== 'low') {
+      tempCtx.fillText(data.company, 15, y); y += 22;
+      tempCtx.fillText(data.department, 15, y); y += 22;
+      tempCtx.fillText(data.office_location, 15, y); y += 22;
+    }
+
+    if (privacy === 'high') {
+      tempCtx.font = '14px Arial';
+      tempCtx.fillText(data.contact.email, 15, y); y += 20;
+      tempCtx.fillText(data.contact.telegram, 15, y); y += 20;
+      tempCtx.fillText(data.branding.slogan, 15, y);
+
+      const qrCanvas = document.createElement('canvas');
+      await new Promise(resolve => {
+        QRCode.toCanvas(qrCanvas, data.contact.email, { width: 50 }, () => {
+          tempCtx.drawImage(qrCanvas, width - 65, height - 65, 50, 50);
+          resolve();
+        });
+      });
+    }
+
+    this.backgroundImage.src = tempCanvas.toDataURL();
+    await new Promise(resolve => {
+      this.backgroundImage.onload = resolve;
+      this.backgroundImage.onerror = resolve;
+    });
+  }
+
+  async updateBackgroundFromData() {
+    try {
+      const text = this.jsonInput.value.trim();
+      if (text) this.employeeData = JSON.parse(text);
+      await this.generatePersonalizedBackground();
+    } catch (err) {
+      alert('Ошибка JSON: ' + err.message);
+    }
+  }
+
+  async loadBodyPixWithFallback() {
+    // Попробуем несколько способов загрузки BodyPix
+    const loaders = [
+      // Способ 1: Прямая загрузка из глобальной переменной
+      () => {
+        if (typeof bodyPix !== 'undefined') {
+          return bodyPix;
+        }
+        throw new Error('BodyPix не найден в глобальной области');
+      },
+      
+      // Способ 2: Попробуем через window
+      () => {
+        if (window.bodyPix) {
+          return window.bodyPix;
+        }
+        throw new Error('BodyPix не найден в window');
+      },
+      
+      // Способ 3: Попробуем динамический импорт
+      async () => {
+        try {
+          // Динамический импорт может сработать если другие способы не работают
+          const bodyPixModule = await import('https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.1/+esm');
+          return bodyPixModule;
+        } catch (e) {
+          throw new Error('Динамическая загрузка не удалась');
+        }
+      }
+    ];
+
+    for (let i = 0; i < loaders.length; i++) {
+      try {
+        const loader = loaders[i];
+        const result = await (loader.constructor.name === 'AsyncFunction' ? loader() : Promise.resolve(loader()));
+        console.log(`BodyPix загружен через способ ${i + 1}`);
+        return result;
+      } catch (error) {
+        console.warn(`Способ ${i + 1} не сработал:`, error.message);
+        if (i === loaders.length - 1) {
+          throw new Error(`Все способы загрузки BodyPix не сработали. Проверьте подключение к интернету.`);
+        }
+      }
+    }
+  }
+
+  async init() {
+    this.loadingEl.textContent = 'Загрузка TensorFlow.js...';
+    
+    try {
+      // Инициализация TensorFlow
+      await tf.setBackend('webgl');
+      await tf.ready();
+      this.loadingEl.textContent = 'TensorFlow.js загружен. Поиск BodyPix...';
+
+      // Загрузка камеры
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, frameRate: { ideal: 30 } },
+        audio: false
+      });
+
+      this.video.srcObject = stream;
+      await new Promise(r => this.video.onloadedmetadata = r);
+      this.canvas.width = this.video.videoWidth;
+      this.canvas.height = this.video.videoHeight;
+
+      // Загрузка BodyPix с fallback
+      this.loadingEl.textContent = 'Загрузка модели BodyPix...';
+      
+      const bodyPixModule = await this.loadBodyPixWithFallback();
+      
+      // Загрузка модели
+      this.net = await bodyPixModule.load({
+        architecture: 'MobileNetV1',
+        outputStride: 16,
+        multiplier: 0.75,
+        quantBytes: 2
+      });
+
+      this.loadingEl.textContent = 'Настройка интерфейса...';
+      this.setSEGConfigFromPreset(this.presetSelect.value);
+      this.initCanvases();
+
+      this.jsonInput.value = JSON.stringify(this.employeeData, null, 2);
+      await this.updateBackgroundFromData();
+      
+      // Активация кнопок
+      this.startBtn.disabled = false;
+      this.stopBtn.disabled = false;
+      this.outputBtn.disabled = false;
+      
+      this.loadingEl.textContent = 'Готов к работе! Нажмите Start для начала сегментации.';
+      this.memoryStatus.textContent = '✅ Все модели загружены успешно';
+      this.memoryStatus.className = 'success';
+      
+      this.setupEventListeners();
+      
+    } catch(e) {
+      this.loadingEl.innerHTML = `Ошибка загрузки: ${e.message}<br>
+                                 <small>Проверьте:<br>
+                                 - Подключение к интернету<br>
+                                 - Блокировку CDN вашим браузером<br>
+                                 - Консоль браузера для подробностей</small>`;
+      this.memoryStatus.textContent = '❌ Ошибка загрузки моделей';
+      this.memoryStatus.className = 'warning';
+      console.error('Ошибка инициализации:', e);
+    }
+  }
+
+  setupEventListeners() {
+    this.startBtn.onclick = async () => {
+      if (!this.net) { 
+        alert('BodyPix не загружен'); 
+        return; 
+      }
+      
+      this.setSEGConfigFromPreset(this.presetSelect.value);
+      
+      // Обновление параметров
+      this.BINARY_THRESH = Number(this.s_thresh.value);
+      this.BLUR_FACTOR = Number(this.s_blur.value);
+      this.FEATHER_PX = Number(this.s_feather.value);
+      this.TEMPORAL_ALPHA = Number(this.s_alpha.value);
+      this.DILATE_RADIUS = Number(this.s_dilate.value);
+      this.adaptive.targetMs = 1000 / Number(this.segFpsInput.value);
+      
+      this.initCanvases();
+      await this.updateBackgroundFromData();
+      this.running = true;
+      this.scheduleLoop();
+    };
+
+    this.stopBtn.onclick = () => { 
+      this.running = false; 
+      this.cleanupMemory();
+    };
+
+    this.cleanupBtn.onclick = () => this.cleanupMemory();
+    this.updateBgBtn.onclick = () => this.updateBackgroundFromData();
+    this.privacyLevelSelect.onchange = () => this.updateBackgroundFromData();
+
+    // Слайдеры
+    this.s_thresh.oninput = () => { 
+      this.BINARY_THRESH = Number(this.s_thresh.value); 
+      this.lab_thresh.textContent = this.BINARY_THRESH; 
+    };
+    
+    this.s_blur.oninput = () => { 
+      this.BLUR_FACTOR = Number(this.s_blur.value); 
+      this.lab_blur.textContent = this.BLUR_FACTOR; 
+    };
+    
+    this.s_feather.oninput = () => { 
+      this.FEATHER_PX = Number(this.s_feather.value); 
+      this.lab_feather.textContent = this.FEATHER_PX; 
+    };
+    
+    this.s_alpha.oninput = () => { 
+      this.TEMPORAL_ALPHA = Number(this.s_alpha.value); 
+      this.lab_alpha.textContent = this.TEMPORAL_ALPHA.toFixed(2); 
+    };
+    
+    this.s_dilate.oninput = () => { 
+      this.DILATE_RADIUS = Number(this.s_dilate.value); 
+      this.lab_dilate.textContent = this.DILATE_RADIUS; 
+    };
+    
+    this.segFpsInput.onchange = () => { 
+      this.adaptive.targetMs = 1000 / Number(this.segFpsInput.value); 
+    };
+    
+    this.presetSelect.onchange = () => { 
+      this.setSEGConfigFromPreset(this.presetSelect.value); 
+      this.initCanvases(); 
+    };
+
+    this.outputBtn.onclick = () => {
+      const outPreview = document.getElementById('outPreview');
+      if (outPreview.srcObject) {
+        outPreview.srcObject.getTracks().forEach(t => t.stop());
+        outPreview.srcObject = null;
+        this.outputBtn.textContent = 'Start Output Stream';
+      } else {
+        outPreview.srcObject = this.canvas.captureStream(25);
+        this.outputBtn.textContent = 'Stop Output Stream';
+      }
+    };
+  }
+}
+
+// Инициализация приложения
+let segmentation;
+
+async function initializeApp() {
+  try {
+    segmentation = new VideoSegmentation();
+    await segmentation.init();
+  } catch (error) {
+    console.error('Failed to initialize app:', error);
+    document.getElementById('loading').innerHTML = 
+      `Критическая ошибка инициализации: ${error.message}<br>
+       <small>Попробуйте обновить страницу или проверьте консоль браузера</small>`;
+  }
+}
+
+// Запуск когда все загружено
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeApp);
+} else {
+  initializeApp();
+}
+</script>
+</body>
+</html>

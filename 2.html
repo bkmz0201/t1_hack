@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Google Meet-style Virtual Background</title>
+<style>
+body { font-family: 'Google Sans', Arial, sans-serif; margin: 20px; background: #f1f3f4; }
+h1 { color: #1a73e8; margin-bottom: 10px; }
+#container { display: flex; gap: 20px; flex-wrap: wrap; }
+#video, #canvas { width: 640px; height: 480px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); }
+#canvas { background: #000; }
+#controls { background: white; padding: 16px; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.2); width: 300px; }
+button { background: #1a73e8; color: white; border: none; padding: 10px 16px; border-radius: 8px; cursor: pointer; font-weight: 500; }
+button:hover { background: #1557b0; }
+button.secondary { background: #e8f0fe; color: #1a73e8; }
+select, textarea { width: 100%; padding: 8px; margin: 8px 0; border: 1px solid #dadce0; border-radius: 8px; }
+.stat { font-size: 14px; color: #5f6368; margin: 4px 0; }
+#loading { color: #5f6368; font-style: italic; }
+</style>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@1.0.4/dist/body-segmentation.min.js"></script>
+<script type="module" src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head>
+<body>
+<h1>Google Meet-style Virtual Background</h1>
+<div id="container">
+  <div>
+    <div id="loading">Загрузка модели и камеры...</div>
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="stat">FPS: <span id="fps">0</span> | Latency: <span id="latency">0</span> ms</div>
+  </div>
+  <div id="controls">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" class="secondary">Stop</button>
+    <button id="outputBtn" class="secondary">Output Stream</button>
+    <label>Privacy Level:
+      <select id="privacyLevel">
+        <option value="low">Low</option>
+        <option value="medium" selected>Medium</option>
+        <option value="high">High</option>
+      </select>
+    </label>
+    <textarea id="jsonInput" rows="6" placeholder='Paste employee JSON...'></textarea>
+    <button id="updateBgBtn" class="secondary">Update Background</button>
+  </div>
+</div>
+
+<script type="module">
+const MEET_CONFIG = {
+  MASK_SIZE: { width: 256, height: 256 },
+  MODEL_TYPE: 'general', // Deeplab
+  FEATHER_PX: 10,
+  TEMPORAL_ALPHA: 0.7,
+  EDGE_BLUR: 5,
+  GAMMA: 1.1,
+  KERNEL_SIZE: 5,
+  SKIP_FRAMES: 1
+};
+
+let video, canvas, ctx, fpsEl, latencyEl, loadingEl;
+let startBtn, stopBtn, outputBtn, privacyLevelSelect, jsonInput, updateBgBtn;
+
+let segmenter = null;
+let hands = null;
+let handsResults = null;
+let running = false;
+let backgroundImage = new Image();
+let lowResCanvas, lowResCtx;
+let frameCount = 0;
+let lastMask = null;
+let prevMask = null;
+let frameTimes = [];
+
+let employeeData = {
+  "employee": {
+    "full_name": "Иванов Сергей Петрович",
+    "position": "Ведущий инженер по компьютерному зрению",
+    "company": "ООО «Рога и Копыта»",
+    "department": "Департамент компьютерного зрения",
+    "office_location": "Новосибирск, технопарк «Идея»",
+    "contact": { "email": "sergey.ivanov@t1dp.ru", "telegram": "@sergey_vision" },
+    "branding": { "corporate_colors": { "primary": "#0052CC", "secondary": "#00B8D9" }, "slogan": "Инновации в каждый кадр" },
+    "privacy_level": "medium"
+  }
+};
+
+// === Background ===
+async function generateBackground() {
+  const w = canvas.width, h = canvas.height;
+  const c = document.createElement('canvas'); c.width=w; c.height=h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+
+  const d = employeeData.employee;
+  const p = privacyLevelSelect.value;
+
+  const grad = ctx.createLinearGradient(0,0,w,h);
+  grad.addColorStop(0,d.branding.corporate_colors.primary);
+  grad.addColorStop(1,d.branding.corporate_colors.secondary);
+  ctx.fillStyle = grad; ctx.fillRect(0,0,w,h);
+
+  ctx.fillStyle = '#fff'; ctx.font='bold 24px sans-serif';
+  let y=40;
+  ctx.fillText(d.full_name,30,y); y+=36;
+  ctx.font='18px sans-serif'; ctx.fillText(d.position,30,y); y+=36;
+  if(p!=='low'){ ctx.fillText(d.company,30,y); y+=30; ctx.fillText(d.department,30,y); y+=30; ctx.fillText(d.office_location,30,y); y+=36; }
+  if(p==='high'){
+    ctx.font='16px sans-serif'; ctx.fillText(d.contact.email,30,y); y+=28;
+    ctx.fillText(d.contact.telegram,30,y); y+=28;
+    ctx.fillText(d.branding.slogan,30,y);
+    const qr=document.createElement('canvas');
+    await new Promise(r=>QRCode.toCanvas(qr,d.contact.email,{width:80},r));
+    ctx.drawImage(qr,w-110,h-110,80,80);
+  }
+
+  backgroundImage.src = c.toDataURL();
+  await new Promise(r=>backgroundImage.onload=r);
+}
+
+// === Init ===
+async function init() {
+  video = document.getElementById('video');
+  canvas = document.getElementById('canvas');
+  ctx = canvas.getContext('2d',{willReadFrequently:true});
+  fpsEl = document.getElementById('fps');
+  latencyEl = document.getElementById('latency');
+  loadingEl = document.getElementById('loading');
+  startBtn = document.getElementById('startBtn');
+  stopBtn = document.getElementById('stopBtn');
+  outputBtn = document.getElementById('outputBtn');
+  privacyLevelSelect = document.getElementById('privacyLevel');
+  jsonInput = document.getElementById('jsonInput');
+  updateBgBtn = document.getElementById('updateBgBtn');
+
+  loadingEl.textContent='Requesting camera...';
+  const stream = await navigator.mediaDevices.getUserMedia({ video:{ width:640, height:480 }});
+  video.srcObject=stream;
+  await new Promise(r=>video.onloadedmetadata=r);
+  canvas.width=video.videoWidth; canvas.height=video.videoHeight;
+
+  lowResCanvas=document.createElement('canvas'); lowResCanvas.width=MEET_CONFIG.MASK_SIZE.width; lowResCanvas.height=MEET_CONFIG.MASK_SIZE.height;
+  lowResCtx=lowResCanvas.getContext('2d',{willReadFrequently:true});
+
+  loadingEl.textContent='Loading segmentation model...';
+  const model = bodySegmentation.SupportedModels.Deeplab;
+  segmenter = await bodySegmentation.createSegmenter(model, { runtime:'tfjs', modelType:'general' });
+
+  loadingEl.textContent='Loading hands model...';
+  const { Hands } = window;
+  hands = new Hands({ locateFile: file=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}` });
+  hands.setOptions({ maxNumHands:2, modelComplexity:1, minDetectionConfidence:0.6, minTrackingConfidence:0.6 });
+  hands.onResults(results=>handsResults=results);
+  await hands.initialize();
+
+  jsonInput.value=JSON.stringify(employeeData,null,2);
+  await generateBackground();
+  loadingEl.style.display='none';
+}
+
+// === Segment & Render ===
+async function segmentAndRender() {
+  const t0 = performance.now();
+  lowResCtx.drawImage(video,0,0,lowResCanvas.width,lowResCanvas.height);
+
+  const imgData = lowResCtx.getImageData(0,0,lowResCanvas.width,lowResCanvas.height);
+  const data = imgData.data; const g=MEET_CONFIG.GAMMA;
+  for(let i=0;i<data.length;i+=4){ data[i]=255*Math.pow(data[i]/255,g);
+        data[i+1]=255*Math.pow(data[i+1]/255,g);
+    data[i+2]=255*Math.pow(data[i+2]/255,g);
+  }
+  lowResCtx.putImageData(imgData,0,0);
+
+  // Отправка кадра в MediaPipe Hands
+  await hands.send({ image: lowResCanvas });
+
+  // Сегментация человека Deeplab
+  const results = await segmenter.segmentPerson(lowResCanvas, { flipHorizontal: false });
+  if(!results) return;
+
+  // Создание маски
+  const mask = await bodySegmentation.toMask(results,
+    {r:0,g:0,b:0,a:0}, {r:255,g:255,b:255,a:255}, true);
+
+  // Применение временной фильтрации
+  if(prevMask && prevMask.width === mask.width){
+    const c = mask.data, p = prevMask.data;
+    for(let i=3;i<c.length;i+=4){
+      c[i] = Math.round(p[i]*(1-MEET_CONFIG.TEMPORAL_ALPHA) + c[i]*MEET_CONFIG.TEMPORAL_ALPHA);
+    }
+  }
+  prevMask = mask;
+
+  // Преобразование маски в canvas и размытие краев
+  const maskCanvas = document.createElement('canvas');
+  maskCanvas.width = canvas.width;
+  maskCanvas.height = canvas.height;
+  const maskCtx = maskCanvas.getContext('2d',{willReadFrequently:true});
+  maskCtx.filter = `blur(${MEET_CONFIG.EDGE_BLUR}px)`;
+  maskCtx.imageSmoothingQuality = 'high';
+  maskCtx.drawImage(createCanvasFromImageData(mask), 0, 0, mask.width, mask.height, 0, 0, maskCanvas.width, maskCanvas.height);
+
+  // Дополнительно выделяем руки, если они обнаружены
+  if(handsResults?.multiHandLandmarks){
+    maskCtx.fillStyle='rgba(255,255,255,1)';
+    for(const landmarks of handsResults.multiHandLandmarks){
+      maskCtx.beginPath();
+      const p = landmarks[0]; maskCtx.moveTo(p.x*maskCanvas.width,p.y*maskCanvas.height);
+      for(let i=1;i<landmarks.length;i++){
+        const p = landmarks[i];
+        maskCtx.lineTo(p.x*maskCanvas.width,p.y*maskCanvas.height);
+      }
+      maskCtx.closePath(); maskCtx.fill();
+    }
+  }
+
+  lastMask = maskCtx.getImageData(0,0,maskCanvas.width,maskCanvas.height);
+
+  // Рисуем итоговый кадр с фоном
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.drawImage(backgroundImage,0,0,canvas.width,canvas.height);
+  ctx.globalCompositeOperation = 'destination-in';
+  ctx.drawImage(maskCanvas,0,0,canvas.width,canvas.height);
+  ctx.globalCompositeOperation = 'source-over';
+
+  latencyEl.textContent = (performance.now()-t0).toFixed(1);
+}
+
+// === UI Event Listeners ===
+function setupEventListeners(){
+  startBtn.onclick = ()=>{ running = true; loop(); };
+  stopBtn.onclick = ()=>{ running = false; };
+  updateBgBtn.onclick = async ()=>{
+    try{
+      employeeData = JSON.parse(jsonInput.value.trim());
+      await generateBackground();
+    }catch(e){ alert('JSON error: '+e.message); }
+  };
+  privacyLevelSelect.onchange = generateBackground;
+}
+
+// === Animation Loop ===
+function loop(){
+  if(!running) return;
+  segmentAndRender().then(()=>{ requestAnimationFrame(loop); });
+}
+
+// === Helper: Convert ImageData to Canvas ===
+function createCanvasFromImageData(imageData){
+  const c = document.createElement('canvas');
+  c.width = imageData.width; c.height = imageData.height;
+  const ctx = c.getContext('2d',{willReadFrequently:true});
+  ctx.putImageData(imageData,0,0);
+  return c;
+}
+
+// === Start ===
+document.addEventListener('DOMContentLoaded', async ()=>{
+  try{
+    await init();
+    setupEventListeners();
+  }catch(err){
+    console.error(err);
+    loadingEl.textContent='Ошибка: '+err.message;
+  }
+});
+</script>
+</body>
+</html>

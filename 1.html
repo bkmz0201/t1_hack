@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Система видеосегментации и персонализированных фонов</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+    h1 { color: #333; }
+    #video, #canvas { width: 320px; height: 240px; border: 1px solid #ccc; display: block; margin-bottom: 10px; }
+    #fps, #latency { font-weight: bold; margin: 5px 0; color: #0052CC; }
+    #error { color: red; margin: 10px 0; }
+    #settings { margin-top: 20px; max-width: 320px; }
+    textarea { width: 100%; height: 150px; padding: 10px; border: 1px solid #ccc; border-radius: 4px; }
+    button { margin-right: 10px; padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; background-color: #0052CC; color: white; }
+    button:hover { background-color: #0066ff; }
+    select { padding: 6px 10px; border-radius: 4px; border: 1px solid #ccc; }
+    #loading { font-style: italic; color: #555; margin-bottom: 10px; }
+  </style>
+
+  <!-- Зависимости -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@1.0.2"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head>
+<body>
+  <h1>Система видеосегментации</h1>
+  <div id="loading">Загрузка модели...</div>
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div id="fps">FPS: 0</div>
+  <div id="latency">Latency: 0 ms</div>
+  <div id="error"></div>
+
+  <div id="settings">
+    <label>Privacy Level:
+      <select id="privacyLevel">
+        <option value="low">Low</option>
+        <option value="medium" selected>Medium</option>
+        <option value="high">High</option>
+      </select>
+    </label>
+    <br><br>
+    <button id="startBtn">Start</button>
+    <button id="stopBtn">Stop</button>
+    <br><br>
+    <textarea id="jsonInput" placeholder="Вставьте JSON сотрудника (опционально)"></textarea>
+    <br>
+    <button id="generateBgBtn">Generate Background</button>
+  </div>
+
+  <script>
+    let video, canvas, ctx, backgroundImage = new Image();
+    let segmenter = null, rafId = null;
+    let lastTime = performance.now();
+    let maskCache = null, maskAge = 0;
+    const MAX_MASK_AGE = 3;
+    let frameCount = 0, frameTimes = [];
+    let prevFrameData = null;
+
+    const fpsElement = document.getElementById('fps');
+    const latencyElement = document.getElementById('latency');
+    const errorElement = document.getElementById('error');
+    const loadingElement = document.getElementById('loading');
+
+    let employeeData = {
+      "employee": {
+        "full_name": "Иванов Сергей Петрович",
+        "position": "Ведущий инженер по компьютерному зрению",
+        "company": "ООО «Рога и Копыта»",
+        "department": "Департамент компьютерного зрения",
+        "office_location": "Новосибирск, технопарк «Идея»",
+        "contact": {
+          "email": "sergey.ivanov@t1dp.ru",
+          "telegram": "@sergey_vision"
+        },
+        "branding": {
+          "logo_url": "",
+          "corporate_colors": {
+            "primary": "#0052CC",
+            "secondary": "#00B8D9"
+          },
+          "slogan": "Инновации в каждый кадр"
+        },
+        "privacy_level": "medium"
+      }
+    };
+
+    function logError(msg) {
+      console.error(msg);
+      errorElement.textContent = msg;
+    }
+
+    async function init() {
+      try {
+        video = document.getElementById('video');
+        canvas = document.getElementById('canvas');
+        ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+        const inputRes = { width: 240, height: 180 };
+        const maskRes = { width: 160, height: 120 };
+
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { width: inputRes.width, height: inputRes.height, frameRate: { ideal: 30 } }
+        });
+        video.srcObject = stream;
+        await new Promise(resolve => video.onloadedmetadata = () => {
+          console.log(`Video stream: ${video.videoWidth}x${video.videoHeight}`);
+          resolve();
+        });
+
+        await new Promise(resolve => {
+          if ('requestVideoFrameCallback' in video) {
+            video.requestVideoFrameCallback(resolve);
+          } else {
+            setTimeout(resolve, 1000);
+          }
+        });
+
+        const backends = ['webgl', 'wasm'];
+        let selectedBackend = 'webgl';
+        for (const backend of backends) {
+          try {
+            await tf.setBackend(backend);
+            await tf.ready();
+            if (tf.getBackend() === backend) {
+              selectedBackend = backend;
+              break;
+            }
+          } catch (err) {
+            console.warn(`Backend ${backend} failed:`, err.message);
+          }
+        }
+        console.log(`Backend: ${selectedBackend}`);
+
+        const model = bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation;
+        segmenter = await bodySegmentation.createSegmenter(model, { 
+          runtime: 'tfjs', 
+          modelType: 'landscape',
+          segmentationThreshold: 0.7,
+          segmentationMaskSize: maskRes
+        });
+        console.log('Model loaded');
+        loadingElement.style.display = 'none';
+
+        await generateBackground();
+        processFrame();
+      } catch (err) {
+        logError('Ошибка инициализации: ' + err.message);
+      }
+    }
+
+    async function generateBackground() {
+      try {
+        const tempCanvas = document.createElement('canvas');
+        tempCanvas.width = 240;
+        tempCanvas.height = 180;
+        const tempCtx = tempCanvas.getContext('2d');
+        const data = employeeData.employee;
+        const privacy = document.getElementById('privacyLevel').value || data.privacy_level;
+        const { primary, secondary } = data.branding.corporate_colors;
+
+        const grad = tempCtx.createLinearGradient(0, 0, 240, 180);
+        grad.addColorStop(0, primary);
+        grad.addColorStop(1, secondary);
+        tempCtx.fillStyle = grad;
+        tempCtx.fillRect(0, 0, 240, 180);
+
+        tempCtx.fillStyle = '#fff';
+        tempCtx.font = 'bold 12px Arial';
+        let y = 15;
+        tempCtx.fillText(data.full_name, 10, y); y += 15;
+        tempCtx.fillText(data.position, 10, y); y += 15;
+
+        if (privacy !== 'low') {
+          tempCtx.fillText(data.company, 10, y); y += 15;
+          tempCtx.fillText(data.department, 10, y); y += 15;
+          tempCtx.fillText(data.office_location, 10, y); y += 15;
+        }
+
+        if (privacy === 'high') {
+          tempCtx.fillText(data.contact.email, 10, y); y += 15;
+          tempCtx.fillText(data.contact.telegram, 10, y); y += 15;
+          tempCtx.fillText(data.branding.slogan, 10, y); y += 15;
+          const qrCanvas = document.createElement('canvas');
+          await new Promise(resolve => {
+            QRCode.toCanvas(qrCanvas, data.contact.email, { width: 30 }, () => {
+              tempCtx.drawImage(qrCanvas, 190, 130, 30, 30);
+              resolve();
+            });
+          });
+        }
+
+        backgroundImage.src = tempCanvas.toDataURL();
+        await new Promise(resolve => {
+          backgroundImage.onload = () => {
+            console.log('Background generated');
+            resolve();
+          };
+          backgroundImage.onerror = () => resolve();
+        });
+      } catch (err) {
+        logError('Ошибка фона: ' + err.message);
+      }
+    }
+
+    function hasMotion() {
+      const tempCanvas = document.createElement('canvas');
+      tempCanvas.width = video.videoWidth / 4;
+      tempCanvas.height = video.videoHeight / 4;
+      const tempCtx = tempCanvas.getContext('2d');
+      tempCtx.drawImage(video, 0, 0, tempCanvas.width, tempCanvas.height);
+      const currData = tempCtx.getImageData(0, 0, tempCanvas.width, tempCanvas.height).data;
+
+      if (!prevFrameData) {
+        prevFrameData = currData.slice();
+        return true;
+      }
+
+      let diff = 0;
+      for (let i = 0; i < currData.length; i += 16) {
+        diff += Math.abs(currData[i] - prevFrameData[i]);
+      }
+      prevFrameData = currData.slice();
+      return diff > 5000;
+    }
+
+    async function processFrame() {
+  if (!segmenter || !video.videoWidth || !video.videoHeight) {
+    rafId = requestAnimationFrame(processFrame);
+    return;
+  }
+
+  const now = performance.now();
+  const targetFps = 25;
+  if (now - lastTime < 1000 / targetFps) {
+    rafId = requestAnimationFrame(processFrame);
+    return;
+  }
+  lastTime = now;
+
+  frameCount++;
+
+  if (maskAge > 0 && !hasMotion()) {
+    await applyMask(maskCache);
+    maskAge--;
+  } else {
+    try {
+      const start = performance.now();
+      const segmentation = await segmenter.segmentPeople(video, { 
+        flipHorizontal: false,
+        multiSegmentation: false,
+        segmentBodyParts: false
+      });
+      const latency = performance.now() - start;
+      latencyElement.textContent = `Latency: ${latency.toFixed(2)} ms`;
+
+      if (segmentation.length > 0) {
+        const maskTensor = segmentation[0].mask;
+        if (maskTensor && maskTensor.shape && maskTensor.shape[0] > 0) {
+          maskCache = maskTensor;
+          maskAge = MAX_MASK_AGE;
+        }
+        await applyMask(maskCache);
+      } else if (maskCache) {
+        await applyMask(maskCache);
+        maskAge = Math.max(0, maskAge - 1);
+      }
+
+      tf.dispose(segmentation.map(s => s.mask));
+      tf.dispose(segmentation);
+    } catch (err) {
+      logError('Ошибка сегментации: ' + err.message);
+    }
+  }
+
+  frameTimes.push(now);
+  if (frameTimes.length > 10) frameTimes.shift();
+  const fps = frameTimes.length / ((now - frameTimes[0]) / 1000);
+  fpsElement.textContent = `FPS: ${fps.toFixed(1)}`;
+
+  if (frameCount % 30 === 0) {
+    tf.engine().startScope();
+    tf.engine().endScope();
+  }
+
+  rafId = requestAnimationFrame(processFrame);
+}
+
+async function applyMask(maskTensor) {
+  if (!maskTensor || !maskTensor.shape || maskTensor.shape[0] === 0) return;
+
+  try {
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Рисуем видео
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+    // Получаем маску
+    const maskImageData = await bodySegmentation.toMaskImageData(maskTensor);
+    const maskCanvas = document.createElement('canvas');
+    maskCanvas.width = maskImageData.width;
+    maskCanvas.height = maskImageData.height;
+    const maskCtx = maskCanvas.getContext('2d');
+    maskCtx.putImageData(maskImageData, 0, 0);
+
+    // Получаем данные
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const maskData = maskCtx.getImageData(0, 0, maskImageData.width, maskImageData.height).data;
+
+    const scaleX = maskImageData.width / canvas.width;
+    const scaleY = maskImageData.height / canvas.height;
+
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        const i = (y * canvas.width + x) * 4;
+        const mx = Math.min(Math.floor(x * scaleX), maskImageData.width - 1);
+        const my = Math.min(Math.floor(y * scaleY), maskImageData.height - 1);
+        const mi = (my * maskImageData.width + mx) * 4;
+        imageData.data[i + 3] = maskData[mi + 3]; // применяем альфу
+      }
+    }
+
+    ctx.putImageData(imageData, 0, 0);
+
+    // Фон
+    if (backgroundImage.complete && backgroundImage.naturalWidth !== 0) {
+      ctx.globalCompositeOperation = 'destination-over';
+      ctx.drawImage(backgroundImage, 0, 0, canvas.width, canvas.height);
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+  } catch (err) {
+    logError('Ошибка отрисовки: ' + err.message);
+  }
+}
+
+    function monitorPerformance() {
+      try {
+        const memory = tf.memory();
+        console.log(`Memory: ${memory.numTensors} tensors, ${Math.round(memory.numBytes / 1024 / 1024)} MB`);
+      } catch (e) {}
+    }
+    setInterval(monitorPerformance, 5000);
+
+    document.getElementById('startBtn').onclick = () => { if (!rafId) processFrame(); };
+    document.getElementById('stopBtn').onclick = () => { if (rafId) cancelAnimationFrame(rafId); rafId = null; };
+    document.getElementById('generateBgBtn').onclick = () => {
+      try {
+        const text = document.getElementById('jsonInput').value.trim();
+        if (text) employeeData = JSON.parse(text);
+        generateBackground();
+      } catch (err) {
+        logError('Ошибка JSON: ' + err.message);
+      }
+    };
+    document.getElementById('privacyLevel').onchange = generateBackground;
+
+    init();
+  </script>
+</body>
+</html>

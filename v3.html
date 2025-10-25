@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Сегментация без утечек памяти</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+    #video, #canvas { width: 640px; height: 480px; border: 2px solid #333; display: block; margin-bottom: 10px; }
+    #fps, #latency, #memory { font-weight: bold; margin: 5px 0; color: #0052CC; }
+    #error { color: red; margin: 10px 0; }
+    #loading { color: #666; margin-bottom: 10px; }
+    button { margin: 5px; padding: 10px 15px; background: #0052CC; color: white; border: none; border-radius: 5px; cursor: pointer; }
+    button:hover { background: #0066FF; }
+    .stats { background: white; padding: 10px; border-radius: 5px; margin: 10px 0; }
+  </style>
+  
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@1.0.2"></script>
+</head>
+<body>
+  <h1>🚀 Сегментация без утечек памяти</h1>
+  <div id="loading">Загрузка оптимизированной модели...</div>
+  
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  
+  <div class="stats">
+    <div id="fps">FPS: 0</div>
+    <div id="latency">Latency: 0 ms</div>
+    <div id="memory">Memory: 0 MB</div>
+    <div id="error"></div>
+  </div>
+
+  <button id="startBtn">▶ Старт</button>
+  <button id="stopBtn">⏹ Стоп</button>
+  <button id="cleanupBtn">🧹 Очистить память</button>
+
+  <script>
+    class MemorySafeSegmentation {
+      constructor() {
+        this.video = document.getElementById('video');
+        this.canvas = document.getElementById('canvas');
+        this.ctx = this.canvas.getContext('2d');
+        this.segmenter = null;
+        this.rafId = null;
+        this.isProcessing = false;
+        this.frameCount = 0;
+        
+        // Кэш canvas элементов
+        this.tempCanvas = document.createElement('canvas');
+        this.tempCtx = this.tempCanvas.getContext('2d');
+        this.maskCanvas = document.createElement('canvas');
+        this.maskCtx = this.maskCanvas.getContext('2d');
+        
+        // Оптимизации памяти
+        this.lastMask = null;
+        this.memoryCleanupCounter = 0;
+        
+        this.stats = {
+          frameTimes: [],
+          fpsElement: document.getElementById('fps'),
+          latencyElement: document.getElementById('latency'),
+          memoryElement: document.getElementById('memory'),
+          errorElement: document.getElementById('error')
+        };
+      }
+
+      async init() {
+        try {
+          // Оптимальные настройки камеры
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+              width: { ideal: 480 },
+              height: { ideal: 360 },
+              frameRate: { ideal: 25 }
+            }
+          });
+          
+          this.video.srcObject = stream;
+          await new Promise(resolve => this.video.onloadedmetadata = resolve);
+
+          await tf.setBackend('webgl');
+          await tf.ready();
+          
+          // Настройки для уменьшения использования памяти
+          tf.ENV.set('WEBGL_DELETE_TEXTURE_THRESHOLD', 0);
+
+          this.segmenter = await bodySegmentation.createSegmenter(
+            bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation,
+            {
+              runtime: 'tfjs',
+              modelType: 'landscape',
+            }
+          );
+
+          document.getElementById('loading').style.display = 'none';
+          console.log('✅ Модель загружена с оптимизацией памяти');
+          
+        } catch (err) {
+          this.logError('Ошибка инициализации: ' + err.message);
+        }
+      }
+
+      async processFrame() {
+        if (!this.segmenter || !this.video.videoWidth || this.isProcessing) {
+          this.rafId = requestAnimationFrame(() => this.processFrame());
+          return;
+        }
+
+        this.isProcessing = true;
+        const startTime = performance.now();
+        this.frameCount++;
+
+        try {
+          // Пропускаем кадры для производительности
+          const shouldProcess = this.frameCount % 3 === 0;
+          
+          if (!shouldProcess && this.lastMask) {
+            this.composeResult(this.lastMask);
+          } else {
+            await this.processNewFrame();
+          }
+
+          // Очистка памяти каждые 30 кадров
+          if (this.frameCount % 30 === 0) {
+            this.cleanupMemory();
+          }
+
+          this.updateStats(startTime);
+
+        } catch (err) {
+          console.error('Ошибка обработки:', err);
+        }
+
+        this.isProcessing = false;
+        this.rafId = requestAnimationFrame(() => this.processFrame());
+      }
+
+      async processNewFrame() {
+        // Подготовка кадра
+        this.tempCanvas.width = this.video.videoWidth;
+        this.tempCanvas.height = this.video.videoHeight;
+        this.tempCtx.drawImage(this.video, 0, 0);
+
+        // Сегментация с ручным управлением памятью
+        let segmentation;
+        try {
+          segmentation = await this.segmenter.segmentPeople(this.tempCanvas, {
+            flipHorizontal: false,
+            multiSegmentation: false
+          });
+        } catch (err) {
+          console.error('Ошибка сегментации:', err);
+          return;
+        }
+
+        if (segmentation.length > 0) {
+          const mask = await this.createOptimizedMask(segmentation[0]);
+          this.lastMask = mask;
+          this.composeResult(mask);
+          
+          // Ручная очистка тензоров из segmentation
+          this.disposeSegmentationTensors(segmentation);
+        }
+      }
+
+      disposeSegmentationTensors(segmentation) {
+        // Ручная очистка тензоров в segmentation
+        segmentation.forEach(segment => {
+          if (segment.mask && segment.mask.dispose) {
+            segment.mask.dispose();
+          }
+          if (segment.confidenceMask && segment.confidenceMask.dispose) {
+            segment.confidenceMask.dispose();
+          }
+        });
+      }
+
+      async createOptimizedMask(segmentation) {
+        const mask = await bodySegmentation.toBinaryMask(
+          segmentation,
+          { r: 255, g: 255, b: 255, a: 255 },
+          { r: 0, g: 0, b: 0, a: 0 },
+          0.4
+        );
+
+        return this.maskToCanvas(mask);
+      }
+
+      maskToCanvas(mask) {
+        const canvas = document.createElement('canvas');
+        canvas.width = mask.width;
+        canvas.height = mask.height;
+        const ctx = canvas.getContext('2d');
+        
+        if (mask instanceof ImageData) {
+          ctx.putImageData(mask, 0, 0);
+        } else {
+          ctx.drawImage(mask, 0, 0);
+        }
+        
+        return canvas;
+      }
+
+      composeResult(mask) {
+        this.canvas.width = this.video.videoWidth;
+        this.canvas.height = this.video.videoHeight;
+        
+        this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+        
+        // Простой фон
+        this.drawBackground();
+        
+        // Рисуем видео с маской
+        this.ctx.drawImage(this.tempCanvas, 0, 0);
+        this.ctx.globalCompositeOperation = 'destination-in';
+        this.ctx.drawImage(mask, 0, 0, this.canvas.width, this.canvas.height);
+        this.ctx.globalCompositeOperation = 'source-over';
+      }
+
+      drawBackground() {
+        const gradient = this.ctx.createLinearGradient(0, 0, this.canvas.width, this.canvas.height);
+        gradient.addColorStop(0, '#667eea');
+        gradient.addColorStop(1, '#764ba2');
+        
+        this.ctx.fillStyle = gradient;
+        this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+      }
+
+      cleanupMemory() {
+        try {
+          console.log('🧹 Очистка памяти. Тензоров до:', tf.memory().numTensors);
+          
+          // Принудительная очистка
+          tf.disposeVariables();
+          
+          // Сброс кэша WebGL
+          const backend = tf.engine().backend;
+          if (backend && backend.getGPGPUContext) {
+            const gl = backend.getGPGPUContext().gl;
+            if (gl && gl.getParameter(gl.MAX_TEXTURE_IMAGE_UNITS)) {
+              // Сброс текстуры
+              gl.flush();
+            }
+          }
+          
+          console.log('🧹 Очистка памяти. Тензоров после:', tf.memory().numTensors);
+          this.updateMemoryStats();
+          
+        } catch (err) {
+          console.warn('Ошибка при очистке памяти:', err);
+        }
+      }
+
+      updateStats(startTime) {
+        const latency = performance.now() - startTime;
+        this.stats.latencyElement.textContent = `Latency: ${latency.toFixed(1)} ms`;
+
+        // FPS
+        this.stats.frameTimes.push(startTime);
+        if (this.stats.frameTimes.length > 20) this.stats.frameTimes.shift();
+        
+        const fps = this.stats.frameTimes.length > 1 ? 
+          1000 / ((startTime - this.stats.frameTimes[0]) / (this.stats.frameTimes.length - 1)) : 0;
+        this.stats.fpsElement.textContent = `FPS: ${fps.toFixed(1)}`;
+
+        this.updateMemoryStats();
+      }
+
+      updateMemoryStats() {
+        try {
+          const memory = tf.memory();
+          const memoryMB = Math.round(memory.numBytes / 1024 / 1024);
+          this.stats.memoryElement.textContent = `Memory: ${memoryMB} MB (${memory.numTensors} тензоров)`;
+          
+          if (memoryMB > 200) {
+            this.stats.memoryElement.style.color = 'red';
+            this.cleanupMemory();
+          } else if (memoryMB > 100) {
+            this.stats.memoryElement.style.color = 'orange';
+          } else {
+            this.stats.memoryElement.style.color = '#0052CC';
+          }
+        } catch (e) {
+          console.warn('Не удалось получить статистику памяти');
+        }
+      }
+
+      logError(msg) {
+        console.error(msg);
+        this.stats.errorElement.textContent = msg;
+      }
+
+      start() {
+        if (!this.rafId) {
+          this.frameCount = 0;
+          this.processFrame();
+        }
+      }
+
+      stop() {
+        if (this.rafId) {
+          cancelAnimationFrame(this.rafId);
+          this.rafId = null;
+          this.cleanupMemory();
+        }
+      }
+
+      forceCleanup() {
+        this.cleanupMemory();
+        alert('Память очищена!');
+      }
+    }
+
+    // Запуск
+    const segmentation = new MemorySafeSegmentation();
+
+    document.getElementById('startBtn').onclick = () => segmentation.start();
+    document.getElementById('stopBtn').onclick = () => segmentation.stop();
+    document.getElementById('cleanupBtn').onclick = () => segmentation.forceCleanup();
+
+    window.addEventListener('beforeunload', () => {
+      segmentation.stop();
+    });
+
+    segmentation.init();
+  </script>
+</body>
+</html>
